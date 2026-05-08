@@ -11,6 +11,7 @@ import {
   ChevronRight,
   Cog,
   FolderOpen,
+  Globe,
   GripVertical,
   LayoutList,
   Logs,
@@ -6653,6 +6654,57 @@ function SettingsScene({
                   })} />
                   <div className="helper-copy helper-copy-compact">
                     <p>These paths are saved to <strong>~/.benchlocal/config.toml</strong>.</p>
+                  </div>
+                  <div className="settings-actions advanced-filesystem-actions">
+                    <button
+                      type="button"
+                      onClick={onResetAdvanced}
+                      disabled={isBusy || !hasUnsavedChanges}
+                      className="ghost-button"
+                    >
+                      <RotateCcw size={14} />
+                      Reset
+                    </button>
+                    <button
+                      type="button"
+                      onClick={onSaveAdvanced}
+                      disabled={isBusy || !hasUnsavedChanges}
+                      className="primary-button"
+                    >
+                      <Save size={14} />
+                      Save
+                    </button>
+                  </div>
+                </Panel>
+                <Panel title="Network" subtitle="Route outbound requests through an HTTP proxy. Applies to all providers, registry, and Bench Pack downloads." tone="sky" icon={<Globe size={16} />}>
+                  <Field
+                    label="HTTP(S) Proxy URL"
+                    value={draft.network.proxy_url ?? ""}
+                    placeholder="http://127.0.0.1:9090"
+                    onChange={(value) => updateDraft((current) => {
+                      const trimmed = value.trim();
+                      if (trimmed) {
+                        current.network.proxy_url = trimmed;
+                      } else {
+                        delete current.network.proxy_url;
+                      }
+                      return current;
+                    })}
+                  />
+                  <FieldToggle
+                    label="Skip TLS Verification"
+                    checked={Boolean(draft.network.insecure_skip_tls_verify)}
+                    onChange={(checked) => updateDraft((current) => {
+                      if (checked) {
+                        current.network.insecure_skip_tls_verify = true;
+                      } else {
+                        delete current.network.insecure_skip_tls_verify;
+                      }
+                      return current;
+                    })}
+                  />
+                  <div className="helper-copy helper-copy-compact">
+                    <p>Leave the proxy URL empty to connect directly. Disable TLS verification only when intercepting HTTPS traffic with a tool like mitmproxy whose CA is not trusted on this machine — it weakens transport security.</p>
                   </div>
                   <div className="settings-actions advanced-filesystem-actions">
                     <button

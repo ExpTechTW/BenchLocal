@@ -30,6 +30,7 @@ import {
 } from "@benchpack-host";
 import { closeDetachedLogsWindow, openDetachedLogsWindow, publishDetachedLogsState } from "./log-window";
 import { loadAppMetadata } from "./app-metadata";
+import { applyNetworkConfig } from "./network";
 import { listAvailableThemes, loadAvailableTheme } from "./themes";
 import { checkForAppUpdates, getAppUpdateState, installDownloadedAppUpdate } from "./updater";
 
@@ -284,11 +285,14 @@ export function registerIpcHandlers(): void {
   const preloadPath = new URL("../preload/index.js", import.meta.url).pathname;
 
   ipcMain.handle(CONFIG_LOAD_CHANNEL, async () => {
-    return loadOrCreateConfig();
+    const loaded = await loadOrCreateConfig();
+    applyNetworkConfig(loaded.config.network);
+    return loaded;
   });
 
   ipcMain.handle(CONFIG_SAVE_CHANNEL, async (_event, config: BenchLocalConfig) => {
     const saved = await saveConfigFile(config, getConfigPath());
+    applyNetworkConfig(saved.network);
 
     return {
       path: getConfigPath(),

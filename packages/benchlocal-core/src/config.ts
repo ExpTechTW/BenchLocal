@@ -61,6 +61,11 @@ export type BenchLocalRegistryConfig = {
   official_url: string;
 };
 
+export type BenchLocalNetworkConfig = {
+  proxy_url?: string;
+  insecure_skip_tls_verify?: boolean;
+};
+
 export type BenchLocalConfig = {
   schema_version: 1;
   default_benchpack: string;
@@ -69,6 +74,7 @@ export type BenchLocalConfig = {
   log_storage_dir: string;
   cache_dir: string;
   registry: BenchLocalRegistryConfig;
+  network: BenchLocalNetworkConfig;
   ui: {
     theme: string;
   };
@@ -161,6 +167,12 @@ const ConfigSchema = z.object({
     .default({
       official_url: "https://raw.githubusercontent.com/stevibe/benchlocal-registry/main/registry.json"
     }),
+  network: z
+    .object({
+      proxy_url: z.string().trim().min(1).optional(),
+      insecure_skip_tls_verify: z.boolean().optional()
+    })
+    .default({}),
   ui: z
     .object({
       theme: z.string().trim().min(1).default("system")
@@ -255,6 +267,7 @@ export function createDefaultConfig(): BenchLocalConfig {
     registry: {
       official_url: "https://raw.githubusercontent.com/stevibe/benchlocal-registry/main/registry.json"
     },
+    network: {},
     ui: {
       theme: "system"
     },
@@ -330,6 +343,10 @@ function normalizeConfig(raw: unknown): BenchLocalConfig {
       ...defaults.registry,
       ...parsed.registry
     },
+    network: {
+      ...defaults.network,
+      ...parsed.network
+    },
     ui: {
       ...defaults.ui,
       ...parsed.ui
@@ -347,6 +364,10 @@ function normalizeConfig(raw: unknown): BenchLocalConfig {
   };
 
   const seenModelIds = new Set<string>();
+
+  if (config.network.proxy_url) {
+    assertValidHttpUrl(config.network.proxy_url, "network.proxy_url");
+  }
 
   for (const [providerId, provider] of Object.entries(config.providers)) {
     assertValidHttpUrl(provider.base_url, `providers.${providerId}.base_url`);

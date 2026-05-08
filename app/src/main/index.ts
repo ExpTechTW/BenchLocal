@@ -4,6 +4,7 @@ import path from "node:path";
 import { getBenchLocalHome, loadOrCreateConfig } from "@core";
 import { loadAppMetadata } from "./app-metadata";
 import { APP_OPEN_ABOUT_CHANNEL, APP_OPEN_SETTINGS_CHANNEL, registerIpcHandlers, stopActiveBenchPackRunsForShutdown } from "./ipc";
+import { applyNetworkConfig } from "./network";
 import { loadAvailableTheme } from "./themes";
 import { checkForAppUpdatesInteractively, initializeAppUpdater } from "./updater";
 
@@ -178,6 +179,7 @@ function buildApplicationMenu(appName: string): void {
 
 async function createMainWindow(): Promise<void> {
   const loadState = await loadOrCreateConfig();
+  applyNetworkConfig(loadState.config.network);
   const savedWindowState = await loadPersistedWindowState();
   const initialBounds = resolveInitialWindowBounds(savedWindowState);
   const effectiveThemeId =
@@ -274,8 +276,9 @@ async function createMainWindow(): Promise<void> {
     });
   }
 
-  if (process.env.VITE_DEV_SERVER_URL) {
-    await window.loadURL(process.env.VITE_DEV_SERVER_URL);
+  const rendererDevUrl = process.env.ELECTRON_RENDERER_URL ?? process.env.VITE_DEV_SERVER_URL;
+  if (rendererDevUrl) {
+    await window.loadURL(rendererDevUrl);
     if (shouldOpenDevTools) {
       window.webContents.openDevTools({ mode: "detach", activate: true });
     }

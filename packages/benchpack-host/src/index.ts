@@ -1956,6 +1956,281 @@ function toNodeHeaders(headers: Headers, overrides?: Record<string, string | und
   return result;
 }
 
+type AggregatedToolCallDelta = {
+  id?: string;
+  type?: string;
+  function?: { name?: string; arguments?: string };
+};
+
+type AggregatedChatChoice = {
+  index: number;
+  message: {
+    role: string;
+    content: string;
+    tool_calls?: AggregatedToolCallDelta[];
+    refusal?: string;
+    function_call?: { name?: string; arguments?: string };
+  };
+  finish_reason: string | null;
+  logprobs?: unknown;
+};
+
+type AggregatedTextChoice = {
+  index: number;
+  text: string;
+  finish_reason: string | null;
+  logprobs?: unknown;
+};
+
+type AggregatedStream = {
+  id?: string;
+  created?: number;
+  model?: string;
+  systemFingerprint?: string;
+  usage?: unknown;
+  chatChoices: Map<number, AggregatedChatChoice>;
+  textChoices: Map<number, AggregatedTextChoice>;
+  isChat: boolean;
+};
+
+function ingestSseDataLine(state: AggregatedStream, dataLine: string): void {
+  const trimmed = dataLine.trim();
+  if (!trimmed || trimmed === "[DONE]") {
+    return;
+  }
+
+  let chunk: Record<string, unknown>;
+  try {
+    chunk = JSON.parse(trimmed) as Record<string, unknown>;
+  } catch {
+    return;
+  }
+
+  if (typeof chunk.id === "string") state.id = chunk.id;
+  if (typeof chunk.created === "number") state.created = chunk.created;
+  if (typeof chunk.model === "string") state.model = chunk.model;
+  if (typeof chunk.system_fingerprint === "string") state.systemFingerprint = chunk.system_fingerprint;
+  if (chunk.usage && typeof chunk.usage === "object") state.usage = chunk.usage;
+
+  const choices = chunk.choices;
+  if (!Array.isArray(choices)) return;
+
+  for (const choice of choices) {
+    if (!choice || typeof choice !== "object") continue;
+    const choiceRecord = choice as Record<string, unknown>;
+    const index = typeof choiceRecord.index === "number" ? choiceRecord.index : 0;
+
+    if (state.isChat) {
+      let agg = state.chatChoices.get(index);
+      if (!agg) {
+        agg = { index, message: { role: "assistant", content: "" }, finish_reason: null };
+        state.chatChoices.set(index, agg);
+      }
+
+      const delta = (choiceRecord.delta && typeof choiceRecord.delta === "object" ? choiceRecord.delta : {}) as Record<string, unknown>;
+      if (typeof delta.role === "string") agg.message.role = delta.role;
+      if (typeof delta.content === "string") agg.message.content += delta.content;
+      if (typeof delta.refusal === "string") agg.message.refusal = (agg.message.refusal ?? "") + delta.refusal;
+
+      const toolCalls = delta.tool_calls;
+      if (Array.isArray(toolCalls)) {
+        if (!agg.message.tool_calls) agg.message.tool_calls = [];
+        for (const tc of toolCalls) {
+          if (!tc || typeof tc !== "object") continue;
+          const tcRecord = tc as Record<string, unknown>;
+          const tcIndex = typeof tcRecord.index === "number" ? tcRecord.index : agg.message.tool_calls.length;
+          let existing = agg.message.tool_calls[tcIndex];
+          if (!existing) {
+            existing = {};
+            agg.message.tool_calls[tcIndex] = existing;
+          }
+          if (typeof tcRecord.id === "string") existing.id = tcRecord.id;
+          if (typeof tcRecord.type === "string") existing.type = tcRecord.type;
+          const fn = tcRecord.function;
+          if (fn && typeof fn === "object") {
+            const fnRecord = fn as Record<string, unknown>;
+            if (!existing.function) existing.function = {};
+            if (typeof fnRecord.name === "string") existing.function.name = fnRecord.name;
+            if (typeof fnRecord.arguments === "string") {
+              existing.function.arguments = (existing.function.arguments ?? "") + fnRecord.arguments;
+            }
+          }
+        }
+      }
+
+      const fnCall = delta.function_call;
+      if (fnCall && typeof fnCall === "object") {
+        const fnCallRecord = fnCall as Record<string, unknown>;
+        if (!agg.message.function_call) agg.message.function_call = {};
+        if (typeof fnCallRecord.name === "string") agg.message.function_call.name = fnCallRecord.name;
+        if (typeof fnCallRecord.arguments === "string") {
+          agg.message.function_call.arguments = (agg.message.function_call.arguments ?? "") + fnCallRecord.arguments;
+        }
+      }
+
+      if (typeof choiceRecord.finish_reason === "string") agg.finish_reason = choiceRecord.finish_reason;
+      if (choiceRecord.logprobs) agg.logprobs = choiceRecord.logprobs;
+    } else {
+      let agg = state.textChoices.get(index);
+      if (!agg) {
+        agg = { index, text: "", finish_reason: null };
+        state.textChoices.set(index, agg);
+      }
+      if (typeof choiceRecord.text === "string") agg.text += choiceRecord.text;
+      if (typeof choiceRecord.finish_reason === "string") agg.finish_reason = choiceRecord.finish_reason;
+      if (choiceRecord.logprobs) agg.logprobs = choiceRecord.logprobs;
+    }
+  }
+}
+
+async function aggregateOpenAiSseStream(
+  body: ReadableStream<Uint8Array>,
+  isChat: boolean
+): Promise<Record<string, unknown>> {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  const state: AggregatedStream = {
+    chatChoices: new Map(),
+    textChoices: new Map(),
+    isChat
+  };
+
+  let buffer = "";
+
+  const drainEvents = (final: boolean) => {
+    let boundary = buffer.indexOf("\n\n");
+    while (boundary !== -1) {
+      const event = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      for (const line of event.split("\n")) {
+        if (line.startsWith("data:")) {
+          ingestSseDataLine(state, line.slice(5));
+        }
+      }
+      boundary = buffer.indexOf("\n\n");
+    }
+
+    if (final && buffer.length > 0) {
+      for (const line of buffer.split("\n")) {
+        if (line.startsWith("data:")) {
+          ingestSseDataLine(state, line.slice(5));
+        }
+      }
+      buffer = "";
+    }
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    drainEvents(false);
+  }
+  buffer += decoder.decode();
+  drainEvents(true);
+
+  const payload: Record<string, unknown> = {
+    id: state.id ?? "",
+    object: isChat ? "chat.completion" : "text_completion",
+    created: state.created ?? Math.floor(Date.now() / 1000),
+    model: state.model ?? ""
+  };
+
+  if (isChat) {
+    const choiceArray = Array.from(state.chatChoices.values())
+      .sort((a, b) => a.index - b.index)
+      .map((choice) => {
+        const cleaned: Record<string, unknown> = {
+          index: choice.index,
+          message: { ...choice.message },
+          finish_reason: choice.finish_reason
+        };
+        if (choice.logprobs) cleaned.logprobs = choice.logprobs;
+        if (choice.message.tool_calls) {
+          const compacted = choice.message.tool_calls.filter((entry) => entry && (entry.id || entry.function || entry.type));
+          if (compacted.length === 0) {
+            delete (cleaned.message as Record<string, unknown>).tool_calls;
+          } else {
+            (cleaned.message as Record<string, unknown>).tool_calls = compacted;
+          }
+        }
+        return cleaned;
+      });
+    payload.choices = choiceArray;
+  } else {
+    const choiceArray = Array.from(state.textChoices.values())
+      .sort((a, b) => a.index - b.index)
+      .map((choice) => {
+        const cleaned: Record<string, unknown> = {
+          index: choice.index,
+          text: choice.text,
+          finish_reason: choice.finish_reason
+        };
+        if (choice.logprobs) cleaned.logprobs = choice.logprobs;
+        return cleaned;
+      });
+    payload.choices = choiceArray;
+  }
+
+  if (state.systemFingerprint) payload.system_fingerprint = state.systemFingerprint;
+  if (state.usage) payload.usage = state.usage;
+
+  return payload;
+}
+
+const UPSTREAM_RETRY_MAX_ATTEMPTS = 3;
+const UPSTREAM_RETRY_BASE_DELAY_MS = 500;
+
+async function fetchUpstreamWithRetry(
+  url: URL,
+  init: RequestInit,
+  logger: HostContext["logger"],
+  context: { requestId: string; modelId: string }
+): Promise<Response> {
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= UPSTREAM_RETRY_MAX_ATTEMPTS; attempt++) {
+    try {
+      const response = await fetch(url, init);
+
+      if (response.status >= 500 && response.status <= 599 && attempt < UPSTREAM_RETRY_MAX_ATTEMPTS) {
+        const status = response.status;
+        try {
+          await response.body?.cancel();
+        } catch {}
+        const delay = UPSTREAM_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1) + Math.floor(Math.random() * 200);
+        logger.warn("Upstream returned 5xx; retrying.", {
+          requestId: context.requestId,
+          modelId: context.modelId,
+          attempt,
+          status,
+          retryInMs: delay
+        });
+        await new Promise((resolve) => setTimeout(resolve, delay));
+        continue;
+      }
+
+      return response;
+    } catch (error) {
+      lastError = error;
+      if (isAbortError(error) || attempt >= UPSTREAM_RETRY_MAX_ATTEMPTS) {
+        throw error;
+      }
+      const delay = UPSTREAM_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1) + Math.floor(Math.random() * 200);
+      logger.warn("Upstream fetch failed; retrying.", {
+        requestId: context.requestId,
+        modelId: context.modelId,
+        attempt,
+        error: toErrorMessage(error),
+        retryInMs: delay
+      });
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error("Upstream fetch failed after retries.");
+}
+
 function rewriteResponseModel(payload: unknown, route: InferenceRoute): unknown {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
     return payload;
@@ -2092,6 +2367,8 @@ async function startInferenceRelay(
       const rawBody = await readIncomingBody(request);
       let route: InferenceRoute | undefined;
       let outboundBody = rawBody;
+      let aggregateUpstreamSse = false;
+      let aggregateAsChat = false;
 
       if (request.method !== "GET" && request.method !== "HEAD" && request.method !== "DELETE") {
         const contentType = String(request.headers["content-type"] ?? "");
@@ -2141,13 +2418,36 @@ async function startInferenceRelay(
           return;
         }
 
-        outboundBody = Buffer.from(
-          JSON.stringify({
-            ...(parsedBody as Record<string, unknown>),
-            model: route.upstreamModel
-          }),
-          "utf8"
-        );
+        const bodyRecord = parsedBody as Record<string, unknown>;
+        const isChatCompletions = normalizedPath === "/chat/completions";
+        const isTextCompletions = normalizedPath === "/completions";
+        const clientWantsStream = bodyRecord.stream === true;
+
+        if ((isChatCompletions || isTextCompletions) && !clientWantsStream) {
+          aggregateUpstreamSse = true;
+          aggregateAsChat = isChatCompletions;
+          const existingStreamOptions =
+            bodyRecord.stream_options && typeof bodyRecord.stream_options === "object"
+              ? (bodyRecord.stream_options as Record<string, unknown>)
+              : {};
+          outboundBody = Buffer.from(
+            JSON.stringify({
+              ...bodyRecord,
+              model: route.upstreamModel,
+              stream: true,
+              stream_options: { ...existingStreamOptions, include_usage: true }
+            }),
+            "utf8"
+          );
+        } else {
+          outboundBody = Buffer.from(
+            JSON.stringify({
+              ...bodyRecord,
+              model: route.upstreamModel
+            }),
+            "utf8"
+          );
+        }
       } else {
         const queryModelId = requestUrl.searchParams.get("model");
         route = queryModelId ? routeMap.get(queryModelId) : routes[0];
@@ -2166,14 +2466,47 @@ async function startInferenceRelay(
       const upstreamUrl = new URL(normalizedPath.replace(/^\//, ""), route.upstreamBaseUrl);
       upstreamUrl.search = requestUrl.search;
 
-      const upstreamResponse = await fetch(upstreamUrl, {
-        method: request.method ?? "GET",
-        headers: createUpstreamHeaders(request, route),
-        body: outboundBody.length > 0 ? outboundBody.toString("utf8") : undefined
-      });
+      const upstreamResponse = await fetchUpstreamWithRetry(
+        upstreamUrl,
+        {
+          method: request.method ?? "GET",
+          headers: createUpstreamHeaders(request, route),
+          body: outboundBody.length > 0 ? outboundBody.toString("utf8") : undefined
+        },
+        logger,
+        { requestId, modelId: route.exposedModel }
+      );
 
       const contentType = upstreamResponse.headers.get("content-type") ?? "";
-      if (contentType.toLowerCase().includes("application/json")) {
+      const lowerContentType = contentType.toLowerCase();
+
+      if (
+        aggregateUpstreamSse &&
+        upstreamResponse.ok &&
+        upstreamResponse.body &&
+        lowerContentType.includes("text/event-stream")
+      ) {
+        const aggregated = await aggregateOpenAiSseStream(
+          upstreamResponse.body as ReadableStream<Uint8Array>,
+          aggregateAsChat
+        );
+        const rewritten = rewriteResponseModel(aggregated, route);
+        const responseBody = JSON.stringify(rewritten);
+
+        response.writeHead(
+          upstreamResponse.status,
+          toNodeHeaders(upstreamResponse.headers, {
+            "content-type": "application/json; charset=utf-8",
+            "content-encoding": undefined,
+            "content-length": String(Buffer.byteLength(responseBody)),
+            "transfer-encoding": undefined
+          })
+        );
+        response.end(responseBody);
+        return;
+      }
+
+      if (lowerContentType.includes("application/json")) {
         const rawText = await upstreamResponse.text();
         let responseBody = rawText;
 
